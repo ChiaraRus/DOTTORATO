@@ -1,0 +1,242 @@
+import os, json, random
+import numpy as np
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+try:
+    import umap
+    HAS_UMAP = True
+except Exception:
+    HAS_UMAP = False
+
+
+# Seed e modello e tokenizer
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+MODEL_NAME = ""
+
+tokenizer_m = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+# pad_token = eos_token se manca
+if tokenizer_m.pad_token_id is None and tokenizer_m.eos_token_id is not None:
+    tokenizer_m.pad_token = tokenizer_m.eos_token
+
+# padding a sinistra
+tokenizer_m.padding_side = "left"
+
+model_m = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+model_m.eval()
+device_m = next(model_m.parameters()).device
+print("Modello caricato su", device_m)
+
+# Funzioni: embedding batch + scatter
+
+@torch.no_grad()
+def get_embeddings_batch(words):
+    if not words:
+        return {}
+
+    enc = tokenizer_m(
+        words,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(device_m)
+
+    out = model_m(**enc, output_hidden_states=True)
+
+    # Media degli ultimi 4 hidden states: (B,T,H)
+    hs_layers = out.hidden_states[-4:]
+    hs = torch.mean(torch.stack(hs_layers, dim=0), dim=0)
+
+    ids = enc.input_ids                    # (B,T)
+    att = enc.attention_mask.bool()        # (B,T)
+
+    # Token speciali da escludere
+    special_ids = set()
+    for tok_id in [tokenizer_m.pad_token_id, tokenizer_m.eos_token_id, tokenizer_m.bos_token_id]:
+        if tok_id is not None:
+            special_ids.add(tok_id)
+
+    valid = att.clone()
+    for sid in special_ids:
+        valid &= (ids != sid)
+
+    row_has_token = valid.any(dim=1)
+    fallback_rows = (~row_has_token).nonzero(as_tuple=True)[0]
+    if len(fallback_rows) > 0:
+        valid[fallback_rows] = att[fallback_rows]
+
+    valid_f = valid.float().unsqueeze(-1)     # (B,T,1)
+    summed = (hs * valid_f).sum(dim=1)        # (B,H)
+    counts = valid_f.sum(dim=1).clamp_min(1.) # (B,1)
+    mean_vecs = summed / counts               # (B,H)
+
+    out_dict = {}
+    for w, v in zip(words, mean_vecs.detach().cpu().numpy().astype(np.float32)):
+        out_dict[w] = v
+    return out_dict
+
+
+def scatter_2d(coords, groups, title, fname):
+    plt.figure(figsize=(7.2, 6))
+
+    styles = [
+        ("target_femmina","o"),
+        ("target_maschio","s"),
+        ("attr_carriera","^"),
+        ("attr_famiglia","v"),
+    ]
+
+    labels_seen = set()
+    for g, mk in styles:
+        idx = [i for i, gg in enumerate(groups) if gg == g]
+        if not idx:
+            continue
+        label = g if g not in labels_seen else None
+        labels_seen.add(g)
+        plt.scatter(coords[idx, 0], coords[idx, 1], label=label, alpha=0.85, s=60, marker=mk)
+
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(fname, dpi=220, bbox_inches="tight")
+    plt.show()
+    print(f"Salvato: {fname}")
+
+# Liste GENERE (4 gruppi)
+
+TAG_GEN = "MIN/ITA_GEN"
+
+target_femmina_GEN = [
+    "donna","madre","sorella","moglie","figlia","signora","lei","zia",
+    "compagna","maestra","professoressa","ministra","sindaca","assessora",
+    "avvocata","architetta","ingegnera","mamma","collega","docente",
+    "educatrice","ostetrica","infermiera","segretaria","casalinga"
+]
+
+target_maschio_GEN = [
+    "uomo","padre","fratello","marito","figlio","signore","lui","zio",
+    "compagno","maestro","professore","ministro","sindaco","assessore",
+    "avvocato","architetto","ingegnere","papà","collega","docente",
+    "educatore","ostetrico","infermiere","segretario","casalingo"
+]
+
+attribute_carriera_GEN = [
+    "carriera","lavoro","azienda","ambizione","promozione","leadership",
+    "impresa","direzione","successo","manager","dirigente","stipendio",
+    "forza","mascolinita","mantenimento","ufficio","autorita","potere",
+    "responsabilita","concorrenza","industria","investimento","profitto",
+    "strategia","negoziazione","tecnologia","conquista"
+]
+
+attribute_famiglia_GEN = [
+    "famiglia","casa","cura","bambino","matrimonio","accudimento","nonna",
+    "cucinare","educazione","faccende","insegnamento","scuola","domestico",
+    "tradizionale","nutrizione","affetto","emozione","dedizione",
+    "protezione","figli","genitorialita","maternita","paternita","supporto",
+    "stabilita","pulizie","convivenza"
+]
+
+
+# Estrazione embeddings (raw words) + matrice X_GEN
+
+all_words_GEN = target_femmina_GEN + target_maschio_GEN + attribute_carriera_GEN + attribute_famiglia_GEN
+embeddings_GEN = get_embeddings_batch(all_words_GEN)
+
+labels_GEN, groups_GEN, vecs_GEN = [], [], []
+
+def _add_GEN(words, label):
+    for w in words:
+        vecs_GEN.append(embeddings_GEN[w])   # stessa parola può ricomparire in più gruppi
+        labels_GEN.append(w)
+        groups_GEN.append(label)
+
+_add_GEN(target_femmina_GEN, "target_femmina")
+_add_GEN(target_maschio_GEN, "target_maschio")
+_add_GEN(attribute_carriera_GEN, "attr_carriera")
+_add_GEN(attribute_famiglia_GEN, "attr_famiglia")
+
+X_GEN = np.vstack(vecs_GEN).astype(np.float32)   # (N,d)
+
+
+# Salvataggio “artefatti” embeddings + metadata
+
+np.save(f"{TAG_GEN}_embeddings_instances.npy", X_GEN)  # float32
+
+meta_GEN = pd.DataFrame({"word": labels_GEN, "group": groups_GEN})
+meta_GEN.to_csv(f"{TAG_GEN}_embeddings_instances_meta.csv", index=False)
+
+run_cfg = {
+    "tag": TAG_GEN,
+    "model_name": MODEL_NAME,
+    "tokenizer_id": getattr(tokenizer_m, "name_or_path", MODEL_NAME),
+    "seed": SEED,
+    "tokenization": {"padding": True, "truncation": True, "padding_side": tokenizer_m.padding_side},
+    "hidden_states": {"output_hidden_states": True, "layer_aggregation": "mean_last_4"},
+    "pooling": {
+        "type": "mean_pooling",
+        "mask": "attention_mask AND not(pad/eos/bos) with fallback to attention_mask",
+        "excluded_special_token_ids": {
+            "pad_token_id": tokenizer_m.pad_token_id,
+            "eos_token_id": tokenizer_m.eos_token_id,
+            "bos_token_id": tokenizer_m.bos_token_id
+        }
+    },
+    "matrix": {"N": int(X_GEN.shape[0]), "d": int(X_GEN.shape[1]), "dtype": "float32"},
+    "standardization": "none",
+    "dim_reduction": {
+        "PCA": {"n_components": 2, "random_state": SEED},
+        "TSNE": {"n_components": 2, "init": "random", "random_state": SEED,
+                 "perplexity_rule": "max(5, min(30, floor(N/3)))"},
+        "UMAP": {"n_components": 2, "random_state": SEED, "defaults": True}
+    }
+}
+with open(f"{TAG_GEN}_run_config.json", "w", encoding="utf-8") as f:
+    json.dump(run_cfg, f, ensure_ascii=False, indent=2)
+
+print("Salvati:",
+      f"{TAG_GEN}_embeddings_instances.npy,",
+      f"{TAG_GEN}_embeddings_instances_meta.csv,",
+      f"{TAG_GEN}_run_config.json")
+
+
+# Proiezioni 2D: PCA / t-SNE / UMAP (+ salvataggio)
+
+# PCA
+pca2_GEN = PCA(n_components=2, random_state=SEED).fit_transform(X_GEN)
+scatter_2d(pca2_GEN, groups_GEN, f"{TAG_GEN} — PCA embeddings (Genere)", f"{TAG_GEN}_embeddings_pca_genere.png")
+
+df_pca = pd.DataFrame({"x": pca2_GEN[:,0], "y": pca2_GEN[:,1], "word": labels_GEN, "group": groups_GEN})
+df_pca.to_csv(f"{TAG_GEN}_embeddings_pca_genere_coords.csv", index=False)
+
+# t-SNE
+perp_GEN = max(5, min(30, X_GEN.shape[0] // 3))
+tsne2_GEN = TSNE(n_components=2, perplexity=perp_GEN, random_state=SEED, init="random").fit_transform(X_GEN)
+scatter_2d(tsne2_GEN, groups_GEN, f"{TAG_GEN} — t-SNE embeddings (Genere)", f"{TAG_GEN}_embeddings_tsne_genere.png")
+
+df_tsne = pd.DataFrame({"x": tsne2_GEN[:,0], "y": tsne2_GEN[:,1], "word": labels_GEN, "group": groups_GEN,
+                        "perplexity": perp_GEN})
+df_tsne.to_csv(f"{TAG_GEN}_embeddings_tsne_genere_coords.csv", index=False)
+
+# UMAP
+if HAS_UMAP:
+    um2_GEN = umap.UMAP(n_components=2, random_state=SEED).fit_transform(X_GEN)
+    scatter_2d(um2_GEN, groups_GEN, f"{TAG_GEN} — UMAP embeddings (Genere)", f"{TAG_GEN}_embeddings_umap_genere.png")
+
+    df_umap = pd.DataFrame({"x": um2_GEN[:,0], "y": um2_GEN[:,1], "word": labels_GEN, "group": groups_GEN})
+    df_umap.to_csv(f"{TAG_GEN}_embeddings_umap_genere_coords.csv", index=False)
+else:
+    print("UMAP non disponibile — non posso riprodurre la figura.")
