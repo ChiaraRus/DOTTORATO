@@ -1,0 +1,257 @@
+# WEAT
+
+import os
+import random
+import unicodedata
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# WEFE / gensim
+from gensim.models import KeyedVectors
+from wefe.word_embedding_model import WordEmbeddingModel
+from wefe.metrics import WEAT
+from wefe.query import Query
+from tqdm import tqdm
+
+# Riproducibilità
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+
+def nfc_lower(s: str) -> str:
+    return unicodedata.normalize("NFC", s).strip().lower()
+
+
+def get_embedding(text: str, tokenizer, model, layer_policy: str = "mean_last4") -> np.ndarray:
+    text = nfc_lower(text)
+    inputs = tokenizer(text, return_tensors="pt", add_special_tokens=True).to(model.device)
+
+    with torch.no_grad():
+        out = model(**inputs, output_hidden_states=True)
+        hidden = out.hidden_states  # tuple: [layer][B, T, H]
+
+    if layer_policy == "mean_last4":
+        token_reps = torch.stack(hidden[-4:], dim=0).mean(0)[0]  # (T, H)
+    elif layer_policy == "last":
+        token_reps = hidden[-1][0]
+    else:
+        raise ValueError("layer_policy deve essere 'mean_last4' o 'last'.")
+
+    input_ids = inputs["input_ids"][0].tolist()
+    attn_mask = inputs["attention_mask"][0].bool()
+
+    special_ids = {tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id}
+    special_ids.discard(None)
+
+    keep = [i for i, (tid, m) in enumerate(zip(input_ids, attn_mask)) if m and tid not in special_ids]
+    if not keep:  # fallback robusto
+        keep = [i for i, m in enumerate(attn_mask) if m]
+
+    vec = token_reps[keep, :].mean(dim=0)       # mean pooling token validi
+    vec = vec / (vec.norm(p=2) + 1e-12)         # L2 normalization
+    return vec.detach().cpu().numpy()
+
+# Liste WEAT
+
+Y = ["donna","madre","sorella","moglie","figlia","signora","lei","zia",
+     "compagna","maestra","professoressa","ministra","sindaca","assessora",
+     "avvocata","architetta","ingegnera","mamma","collega","docente",
+     "educatrice","ostetrica","infermiera","segretaria","casalinga"]
+
+X = ["uomo","padre","fratello","marito","figlio","signore","lui","zio",
+     "compagno","maestro","professore","ministro","sindaco","assessore",
+     "avvocato","architetto","ingegnere","papà","collega","docente",
+     "educatore","ostetrico","infermiere","segretario","casalingo"]
+
+A = ["carriera","lavoro","azienda","ambizione","promozione","leadership",
+     "impresa","direzione","successo","manager","dirigente","stipendio",
+     "forza","mascolinita","mantenimento","ufficio","autorita","potere",
+     "ingegneria","tecnologia","scienza","economia","finanza","politica",
+     "ministero","ministeriale","consiglio"]
+
+B = ["famiglia","casa","bambini","cura","accudimento","affetto",
+     "tenerezza","dolcezza","rassicurazione","maternità","paternità",
+     "genitorialita","supporto","stabilita","pulizie","convivenza",
+     "nutrizione","scuola","asilo","cameretta","gioco","educazione",
+     "faccende","spesa","cucinare","stirare","piatti"]
+
+
+def build_wem_from_model(tokenizer, model, words: List[str]) -> WordEmbeddingModel:
+    embedding_dict: Dict[str, np.ndarray] = {}
+    print(f"Attempting to get embeddings for {len(words)} words.")
+    for w in words:
+        try:
+            emb = get_embedding(w, tokenizer, model, layer_policy="mean_last4")
+            embedding_dict[nfc_lower(w)] = emb
+            print(f"Successfully got embedding for: {w}")
+        except Exception as e:
+            print(f"Failed to get embedding for {w}: {e}")
+
+    if not embedding_dict:
+        raise ValueError("embedding_dict is empty. Cannot create KeyedVectors object.")
+
+    vectors = KeyedVectors(vector_size=list(embedding_dict.values())[0].shape[0])
+    vectors.add_vectors(list(embedding_dict.keys()), list(embedding_dict.values()))
+    return WordEmbeddingModel(vectors)
+
+
+def export_s_w_csv(outfile: str, wem: WordEmbeddingModel) -> None:
+    import csv
+
+    def cosine(u, v):
+        u = u / (np.linalg.norm(u) + 1e-12)
+        v = v / (np.linalg.norm(v) + 1e-12)
+        return float(np.dot(u, v))
+
+    def s_w(word, A, B, wem):
+        w = nfc_lower(word)
+        if w not in wem:
+            return None
+        wv = wem[w]
+
+        A_ = [nfc_lower(a) for a in A if nfc_lower(a) in wem]
+        B_ = [nfc_lower(b) for b in B if nfc_lower(b) in wem]
+        if not A_ or not B_:
+            return None
+
+        mA = np.mean([cosine(wv, wem[a]) for a in A_])
+        mB = np.mean([cosine(wv, wem[b]) for b in B_])
+        return mA - mB
+
+    with open(outfile, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["word", "set", "s_w"])
+
+        X_filtered = [t for t in X if nfc_lower(t) in wem]
+        Y_filtered = [t for t in Y if nfc_lower(t) in wem]
+        print(f"Words in X found in vocabulary: {len(X_filtered)}/{len(X)}")
+        print(f"Words in Y found in vocabulary: {len(Y_filtered)}/{len(Y)}")
+
+        for word in X_filtered:
+            val = s_w(word, A, B, wem)
+            if val is not None:
+                w.writerow([nfc_lower(word), "X", f"{val:.8f}"])
+
+        for word in Y_filtered:
+            val = s_w(word, A, B, wem)
+            if val is not None:
+                w.writerow([nfc_lower(word), "Y", f"{val:.8f}"])
+
+    print(f"[OK] Salvato: {outfile}")
+
+
+def run_weat_query(metric: WEAT, query: Query, wem: WordEmbeddingModel, *, perms: int, seed: int, batch_size: int,
+                  warn_not_found_words: bool = True, verbose: bool = True) -> Dict:
+    try:
+        return metric.run_query(
+            query,
+            wem,
+            calculate_p_value=True,
+            number_of_permutations=perms,
+            seed=seed,
+            warn_not_found_words=warn_not_found_words,
+            batch_size=batch_size,
+            verbose=verbose,
+        )
+    except TypeError:
+        return metric.run_query(
+            query,
+            wem,
+            calculate_p_value=True,
+            p_value_method="approximate",
+            p_value_iterations=perms,
+            warn_not_found_words=warn_not_found_words,
+            verbose=verbose,
+        )
+
+
+def main():
+    MODEL_NAME = ""
+    PERMUTATIONS = 10_000
+    BATCH_SIZE = 32
+
+    # Carico modello
+    tokenizer_m = AutoTokenizer.from_pretrained(MODEL_NAME)
+    if tokenizer_m.pad_token_id is None and tokenizer_m.eos_token_id is not None:
+        tokenizer_m.pad_token = tokenizer_m.eos_token
+    tokenizer_m.padding_side = "left"
+
+    model_m = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+    model_m.eval()
+    device_m = next(model_m.parameters()).device
+    print("Modello caricato su", device_m)
+
+    # Costruisco WEFE model (WEM)
+    words = list(set([*X, *Y, *A, *B]))
+    wem = build_wem_from_model(tokenizer_m, model_m, words)
+
+    # WEAT (genere)
+    query = Query(
+        target_sets=[X, Y],
+        attribute_sets=[A, B],
+        target_sets_names=["maschile", "femminile"],
+        attribute_sets_names=["carriera", "famiglia"]
+    )
+
+    metric = WEAT()
+    print("Inizio calcolo WEAT (potrebbe richiedere del tempo)...")
+    result = run_weat_query(metric, query, wem, perms=PERMUTATIONS, seed=SEED, batch_size=BATCH_SIZE)
+
+    print("\n=== WEAT GENERE (WEFE) ===")
+    print("Effect size:", result.get("effect_size"))
+    print("P-value:", result.get("p_value"))
+
+    # Export s(w) e controllo d_hat (manuale)
+    outfile = "weat_genere_scores.csv"
+    export_s_w_csv(outfile, wem)
+
+    df = pd.read_csv(outfile)
+    muX = df[df["set"] == "X"]["s_w"].astype(float).mean()
+    muY = df[df["set"] == "Y"]["s_w"].astype(float).mean()
+    sd = df["s_w"].astype(float).std(ddof=1)
+    d_hat = (muX - muY) / sd if sd and not np.isnan(sd) else np.nan
+    print("\n[CHECK] d_hat (da s(w)):", d_hat)
+
+    # Test metamorfico: swap X↔Y
+    q_swap = Query(
+        target_sets=[Y, X],
+        attribute_sets=[A, B],
+        target_sets_names=["femminile", "maschile"],
+        attribute_sets_names=["carriera", "famiglia"]
+    )
+
+    res_swap = run_weat_query(metric, q_swap, wem, perms=PERMUTATIONS, seed=SEED, batch_size=BATCH_SIZE,
+                             warn_not_found_words=False, verbose=False)
+
+    print("\n=== WEAT GENERE (SWAP) ===")
+    print("effect_size:", res_swap.get("effect_size"))
+    print("p_value:", res_swap.get("p_value"))
+
+    # Ablation
+    ban = {"mamma", "papà", "casalinga", "casalingo", "zia"}
+    X_ab = [t for t in X if nfc_lower(t) not in ban]
+    Y_ab = [t for t in Y if nfc_lower(t) not in ban]
+    q_ab = Query(target_sets=[X_ab, Y_ab], attribute_sets=[A, B])
+
+    res_ab = run_weat_query(metric, q_ab, wem, perms=PERMUTATIONS, seed=SEED, batch_size=BATCH_SIZE,
+                           warn_not_found_words=True, verbose=False)
+
+    print("\n=== WEAT GENERE (ABLATION ban={mamma,papà,casaling*,zia}) ===")
+    print("Ablated d, p:", res_ab.get("effect_size"), res_ab.get("p_value"))
+if __name__ == "__main__":
+    main()
