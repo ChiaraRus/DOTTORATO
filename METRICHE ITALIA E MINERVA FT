@@ -1,0 +1,32 @@
+from google.colab import files
+import os
+
+# Definisco i percorsi predefiniti dei file
+italia_default_path = '/content/confronto_base_vs_finetuned_Italia.numbers'
+minerva_default_path = '/content/confronto_benchmark_minerva.csv'
+out_dir = 'analysis_output'
+
+italia_path = italia_default_path
+minerva_path = minerva_default_path
+
+print("Verifica file Italia...")
+if not os.path.exists(italia_default_path):
+    print(f"File Italia non trovato in {italia_default_path}. Carica il file Italia (CSV o Numbers).")
+    uploaded_italia = files.upload()
+    if uploaded_italia:
+        italia_path = list(uploaded_italia.keys())[0]
+    else:
+        raise FileNotFoundError("Nessun file Italia caricato. Impossibile procedere.")
+else:
+    print(f"Utilizzo il file Italia esistente: {italia_default_path}")
+
+print("\nVerifica file Minerva...")
+if not os.path.exists(minerva_default_path):
+    print(f"File Minerva non trovato in {minerva_default_path}. Carica il file Minerva (CSV).")
+    uploaded_minerva = files.upload()
+    if uploaded_minerva:
+        minerva_path = list(uploaded_minerva.keys())[0]
+    else:
+        raise FileNotFoundError("Nessun file Minerva caricato. Impossibile procedere.")
+else:
+    print(f"Utilizzo il file Minerva esistente: {minerva_default_path}")
